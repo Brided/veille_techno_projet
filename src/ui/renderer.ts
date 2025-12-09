@@ -229,6 +229,20 @@ function concatLiveSamples(maxSamples: number): Float32Array {
   return out;
 }
 
+// Concatenate all available liveChunks into one contiguous buffer (no trimming)
+function concatAllLiveSamples(): Float32Array {
+  if (liveChunks.length === 0) return new Float32Array(0);
+  let total = 0;
+  for (const c of liveChunks) total += c.length;
+  const out = new Float32Array(total);
+  let off = 0;
+  for (const c of liveChunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
+
 function drawLiveWaveform() {
   const maxSamples = Math.max(1024, Math.floor(MAX_LIVE_SECONDS * liveSampleRate));
   const samples = concatLiveSamples(maxSamples);
@@ -532,8 +546,10 @@ if (refreshBtn) {
       if (recStatus) recStatus.textContent = 'Refreshing...';
       adjustCanvasSize();
       if (liveChunks.length > 0) {
-        // draw current live buffer
-        drawLiveWaveform();
+        // stop live animation and draw the full concatenated recording buffer
+        stopLiveDrawing();
+        const full = concatAllLiveSamples();
+        if (full.length > 0) drawWaveform(full);
       } else if (currentAudioPath) {
         // re-decode and draw the opened file (this also updates transcript text)
         try {
