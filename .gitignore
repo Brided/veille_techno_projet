@@ -1,2 +1,22 @@
 node_modules/
 .env
+
+# TypeScript / tsc build outputs
+# Common output folders
+dist/
+out/
+build/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+.tsbuildinfo
+
+# Ignore compiled JS and source maps produced by tsc in the source tree
+src/**/*.js
+src/**/*.js.map
+src/**/*.d.ts
+src/**/*.d.ts.map
+
+!electron/
+# If you intentionally commit compiled files (for example electron/main.js),
+# add a negation rule like: `!electron/main.js`
