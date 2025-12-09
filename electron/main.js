@@ -60,3 +60,48 @@ ipcMain.handle('transcribe-file', async (_, filePath) => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
+
+// Simple streaming handlers that use the recording service
+ipcMain.handle('stream-start', async (_, sessionId = 'default') => {
+  try {
+    const svcPath = path.join(__dirname, '..', 'src', 'services', 'recording.js');
+    const rec = await import(pathToFileURL(svcPath).href);
+    if (!rec || !rec.startSession) throw new Error('recording service not found');
+    rec.startSession(sessionId);
+    return { ok: true };
+  } catch (err) {
+    console.error('stream-start error', err);
+    return { ok: false, error: String(err) };
+  }
+});
+
+ipcMain.handle('stream-chunk', async (_, sessionId = 'default', arrayBuffer) => {
+  try {
+    const svcPath = path.join(__dirname, '..', 'src', 'services', 'recording.js');
+    const rec = await import(pathToFileURL(svcPath).href);
+    rec.pushChunk(sessionId, arrayBuffer);
+    return { ok: true };
+  } catch (err) {
+    console.error('stream-chunk error', err);
+    return { ok: false, error: String(err) };
+  }
+});
+
+ipcMain.handle('stream-end', async (event, sessionId = 'default') => {
+  try {
+    const svcPath = path.join(__dirname, '..', 'src', 'services', 'recording.js');
+    const rec = await import(pathToFileURL(svcPath).href);
+    const text = await rec.endSession(sessionId);
+    // notify renderer that transcription completed
+    try {
+      const win = BrowserWindow.getAllWindows()[0];
+      if (win) win.webContents.send('transcription-result', sessionId, text);
+    } catch (e) {
+      console.warn('could not notify renderer', e);
+    }
+    return { ok: true, text };
+  } catch (err) {
+    console.error('stream-end error', err);
+    return { ok: false, error: String(err) };
+  }
+});

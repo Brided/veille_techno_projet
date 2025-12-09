@@ -13,6 +13,10 @@ declare global {
       openAudioFile: () => Promise<string | null>;
       saveTranscript: (filePath: string, text: string) => Promise<boolean>;
       transcribeFile: (filePath: string) => Promise<{ok: boolean; text?: string; error?: string}>;
+      startStream: (sessionId?: string) => Promise<any>;
+      sendStreamChunk: (sessionId: string, arrayBuffer: ArrayBuffer) => Promise<any>;
+      endStream: (sessionId?: string) => Promise<any>;
+      onTranscription: (cb: (sessionId: string, text: string) => void) => void;
     };
   }
 }
@@ -21,11 +25,35 @@ const modelId = "Xenova/whisper-small.en"; // default model
 
 const openBtn = document.getElementById("openBtn") as HTMLButtonElement;
 const saveBtn = document.getElementById("saveBtn") as HTMLButtonElement;
+const recordBtn = document.getElementById('recordBtn') as HTMLButtonElement;
+const recStatus = document.getElementById('recStatus') as HTMLElement;
 const transcriptEl = document.getElementById("transcript") as HTMLElement;
 const canvas = document.getElementById("waveCanvas") as HTMLCanvasElement;
 const ctx = canvas.getContext("2d")!;
 
+// Ensure canvas pixel size matches display size for crisp drawing
+function adjustCanvasSize() {
+  const ratio = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 600;
+  const h = canvas.clientHeight || 150;
+  // reset transform to avoid cumulative scaling
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  canvas.width = Math.max(1, Math.floor(w * ratio));
+  canvas.height = Math.max(1, Math.floor(h * ratio));
+  ctx.scale(ratio, ratio);
+}
+window.addEventListener('resize', adjustCanvasSize);
+adjustCanvasSize();
+
 let currentAudioPath: string | null = null;
+let mediaRecorder: MediaRecorder | null = null;
+let currentSessionId: string | null = null;
+
+// Live waveform drawing state
+let liveChunks: Float32Array[] = [];
+let liveSampleRate = 16000; // will be overwritten by decoded chunk sampleRate if available
+let drawAnimationId: number | null = null;
+const MAX_LIVE_SECONDS = 6; // keep last N seconds for display
 
 // If the preload bridge didn't expose `electronAPI`, surface a helpful error immediately.
 if (!window.electronAPI) {
@@ -102,9 +130,10 @@ async function resampleFloat32Array(input: Float32Array, srcRate: number, dstRat
 }
 
 function drawWaveform(samples: Float32Array) {
-  const w = canvas.width;
-  const h = canvas.height;
-  ctx.clearRect(0,0,w,h);
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.floor(canvas.width / dpr));
+  const h = Math.max(1, Math.floor(canvas.height / dpr));
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = "#fff";
   ctx.fillRect(0,0,w,h);
   ctx.strokeStyle = "#007acc";
@@ -125,6 +154,94 @@ function drawWaveform(samples: Float32Array) {
     ctx.lineTo(i, y2);
   }
   ctx.stroke();
+}
+
+// Build a single Float32Array from liveChunks (oldest -> newest), limited to maxSamples
+function concatLiveSamples(maxSamples: number): Float32Array {
+  if (liveChunks.length === 0) return new Float32Array(0);
+  // compute total length
+  let total = 0;
+  for (const c of liveChunks) total += c.length;
+  // if under limit, concat all
+  if (total <= maxSamples) {
+    const out = new Float32Array(total);
+    let off = 0;
+    for (const c of liveChunks) {
+      out.set(c, off);
+      off += c.length;
+    }
+    return out;
+  }
+  // need to drop oldest samples to fit
+  let toDrop = total - maxSamples;
+  let startIndex = 0;
+  while (startIndex < liveChunks.length && toDrop > 0) {
+    if (liveChunks[startIndex].length <= toDrop) {
+      toDrop -= liveChunks[startIndex].length;
+      startIndex++;
+    } else {
+      // partially drop from start of this chunk
+      const keep = liveChunks[startIndex].length - toDrop;
+      const out = new Float32Array(maxSamples);
+      let off = 0;
+      // copy partial from this chunk
+      out.set(liveChunks[startIndex].subarray(liveChunks[startIndex].length - keep), off);
+      off += keep;
+      // copy the rest
+      for (let i = startIndex + 1; i < liveChunks.length; i++) {
+        out.set(liveChunks[i], off);
+        off += liveChunks[i].length;
+      }
+      return out;
+    }
+  }
+  // if we've skipped whole chunks, copy remaining
+  const remaining = liveChunks.slice(startIndex);
+  const out = new Float32Array(maxSamples);
+  let off = 0;
+  for (const c of remaining) {
+    if (off + c.length > maxSamples) {
+      out.set(c.subarray(0, maxSamples - off), off);
+      break;
+    }
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
+
+function drawLiveWaveform() {
+  const maxSamples = Math.max(1024, Math.floor(MAX_LIVE_SECONDS * liveSampleRate));
+  const samples = concatLiveSamples(maxSamples);
+  if (samples.length === 0) {
+    // clear canvas using display size
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.floor(canvas.width / dpr));
+    const h = Math.max(1, Math.floor(canvas.height / dpr));
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, w, h);
+  } else {
+    drawWaveform(samples);
+  }
+}
+
+function startLiveDrawing() {
+  if (drawAnimationId) return;
+  function loop() {
+    drawLiveWaveform();
+    drawAnimationId = requestAnimationFrame(loop);
+  }
+  drawAnimationId = requestAnimationFrame(loop);
+}
+
+function stopLiveDrawing() {
+  if (drawAnimationId) {
+    cancelAnimationFrame(drawAnimationId);
+    drawAnimationId = null;
+  }
+  // optionally clear the canvas
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
 async function transcribeFile(path: string) {
@@ -171,6 +288,92 @@ openBtn.addEventListener('click', async () => {
     transcriptEl.textContent = `Error opening file: ${err?.message ?? err}`;
     alert(`Open failed: ${err?.message ?? err}`);
   }
+});
+
+// Recording controls
+recordBtn.addEventListener('click', async () => {
+  if (!recordBtn) return;
+  try {
+    if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+      // start
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorder = new MediaRecorder(stream);
+      currentSessionId = `s_${Date.now()}`;
+      // notify main
+      await window.electronAPI.startStream(currentSessionId);
+      mediaRecorder.ondataavailable = async (e: BlobEvent) => {
+        if (!e.data || e.data.size === 0) return;
+        const ab = await e.data.arrayBuffer();
+        try {
+          await window.electronAPI.sendStreamChunk(currentSessionId!, ab);
+        } catch (err) {
+          console.error('sendStreamChunk error', err);
+        }
+        // Also decode locally and add to live buffer for waveform visualization
+        try {
+          const { samples, sampleRate } = await decodeArrayBufferToFloat32(ab);
+          liveSampleRate = sampleRate || liveSampleRate;
+          liveChunks.push(samples);
+          // trim to MAX_LIVE_SECONDS
+          const maxSamples = MAX_LIVE_SECONDS * liveSampleRate;
+          let total = 0;
+          for (let i = liveChunks.length - 1; i >= 0; i--) {
+            total += liveChunks[i].length;
+            if (total > maxSamples) {
+              // drop oldest until under limit
+              while (liveChunks.length && total > maxSamples) {
+                total -= liveChunks[0].length;
+                liveChunks.shift();
+              }
+              break;
+            }
+          }
+          // ensure animation running
+          if (!drawAnimationId) startLiveDrawing();
+        } catch (err) {
+          console.warn('live decode error', err);
+        }
+      };
+      mediaRecorder.onstart = () => {
+        if (recStatus) recStatus.textContent = 'Recording...';
+        recordBtn.textContent = 'Stop';
+        // reset live buffer and start drawing
+        liveChunks = [];
+        drawAnimationId = null;
+        startLiveDrawing();
+      };
+      mediaRecorder.onstop = async () => {
+        if (recStatus) recStatus.textContent = 'Finalizing...';
+        recordBtn.textContent = 'Record';
+        try {
+          const resp = await window.electronAPI.endStream(currentSessionId!);
+          if (!resp || !resp.ok) {
+            transcriptEl.textContent = `Error: ${resp?.error ?? 'unknown'}`;
+          }
+        } catch (err) {
+          console.error('endStream error', err);
+          transcriptEl.textContent = `Error: ${err?.message ?? err}`;
+        } finally {
+          if (recStatus) recStatus.textContent = 'Idle';
+          currentSessionId = null;
+          stopLiveDrawing();
+        }
+      };
+      mediaRecorder.start(250); // emit blobs every 250ms
+    } else if (mediaRecorder.state === 'recording') {
+      mediaRecorder.stop();
+    }
+  } catch (err: any) {
+    console.error('recordBtn handler error', err);
+    alert('Recording failed: ' + (err?.message ?? err));
+  }
+});
+
+// receive transcription results
+window.electronAPI.onTranscription((sid, text) => {
+  // If this is the current session or no session specified, show text
+  transcriptEl.textContent = text ?? '';
+  if (recStatus) recStatus.textContent = 'Idle';
 });
 
 saveBtn.addEventListener('click', async () => {
