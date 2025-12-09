@@ -7,10 +7,10 @@
     "transcribe": "ts-node src/cli/transcribe.ts",
     "clean": "tsc --build --clean",
     "noemit": "npx tsc --noEmit",
-    "build": "tsc",
+    "build": "tsc || npm run build:ui",
     "build:ui": "esbuild src/ui/renderer.ts --bundle --outfile=src/ui/renderer.js --platform=browser --format=esm --minify",
     "build:renderer": "npx esbuild src/ui/renderer.ts --bundle --outfile=src/ui/renderer.js --platform=browser --format=esm",
-    "electron": "npm run build:ui && electron .",
+    "electron": "npm run build && electron .",
     "test": "jest --runInBand",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage"

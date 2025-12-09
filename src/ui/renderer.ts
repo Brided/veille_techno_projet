@@ -26,6 +26,7 @@ const modelId = "Xenova/whisper-small.en"; // default model
 const openBtn = document.getElementById("openBtn") as HTMLButtonElement;
 const saveBtn = document.getElementById("saveBtn") as HTMLButtonElement;
 const recordBtn = document.getElementById('recordBtn') as HTMLButtonElement;
+const refreshBtn = document.getElementById('refreshBtn') as HTMLButtonElement | null;
 const recStatus = document.getElementById('recStatus') as HTMLElement;
 const transcriptEl = document.getElementById("transcript") as HTMLElement;
 const canvas = document.getElementById("waveCanvas") as HTMLCanvasElement;
@@ -54,6 +55,24 @@ let liveChunks: Float32Array[] = [];
 let liveSampleRate = 16000; // will be overwritten by decoded chunk sampleRate if available
 let drawAnimationId: number | null = null;
 const MAX_LIVE_SECONDS = 6; // keep last N seconds for display
+let pendingDecodes = 0;
+// AudioWorklet capture state (for reliable real-time PCM)
+let audioCtxCapture: AudioContext | null = null;
+let audioWorkletNode: AudioWorkletNode | null = null;
+let mediaStreamSource: MediaStreamAudioSourceNode | null = null;
+let captureGainNode: GainNode | null = null;
+
+
+function sleep(ms: number) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+async function waitForPendingDecodes(timeoutMs = 1000) {
+  const start = Date.now();
+  while (pendingDecodes > 0 && (Date.now() - start) < timeoutMs) {
+    await sleep(30);
+  }
+}
 
 // If the preload bridge didn't expose `electronAPI`, surface a helpful error immediately.
 if (!window.electronAPI) {
@@ -240,8 +259,7 @@ function stopLiveDrawing() {
     cancelAnimationFrame(drawAnimationId);
     drawAnimationId = null;
   }
-  // optionally clear the canvas
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // keep the last drawn frame so users can see the final waveform after stopping
 }
 
 async function transcribeFile(path: string) {
@@ -265,6 +283,100 @@ async function transcribeFile(path: string) {
   }
   transcriptEl.textContent = resp.text ?? '';
   return resp.text ?? '';
+}
+ 
+// AudioWorklet helper: start capturing PCM frames from the microphone stream.
+async function startAudioCaptureIfNeeded() {
+  if (audioCtxCapture) return;
+  try {
+    audioCtxCapture = new (window.AudioContext || (window as any).webkitAudioContext)();
+    // create a tiny worklet that posts input channel data to the main thread
+    const workletCode = `class PCMProcessor extends AudioWorkletProcessor {\n  process(inputs) {\n    try {\n      const input = inputs[0];\n      if (input && input[0]) {\n        // copy to transferable Float32Array
+        const buffer = new Float32Array(input[0]);\n        this.port.postMessage(buffer, [buffer.buffer]);\n      }\n    } catch (e) {\n      // ignore\n    }\n    return true;\n  }\n}\nregisterProcessor('pcm-processor', PCMProcessor);`;
+    const blob = new Blob([workletCode], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    await audioCtxCapture.audioWorklet.addModule(url);
+    audioWorkletNode = new AudioWorkletNode(audioCtxCapture, 'pcm-processor');
+    audioWorkletNode.port.onmessage = (ev: MessageEvent) => {
+      try {
+        const data = ev.data as Float32Array;
+        // ensure a concrete copy
+        const samples = new Float32Array(data.length);
+        samples.set(data);
+        liveSampleRate = audioCtxCapture?.sampleRate || liveSampleRate;
+        liveChunks.push(samples);
+        // trim
+        const maxSamples = MAX_LIVE_SECONDS * liveSampleRate;
+        let total = 0;
+        for (let i = liveChunks.length - 1; i >= 0; i--) {
+          total += liveChunks[i].length;
+          if (total > maxSamples) {
+            while (liveChunks.length && total > maxSamples) {
+              total -= liveChunks[0].length;
+              liveChunks.shift();
+            }
+            break;
+          }
+        }
+        if (!drawAnimationId) startLiveDrawing();
+      } catch (err) {
+        console.warn('worklet onmessage error', err);
+      }
+    };
+    // create a silent gain node to connect output so processor runs reliably
+    captureGainNode = audioCtxCapture.createGain();
+    captureGainNode.gain.value = 0;
+    captureGainNode.connect(audioCtxCapture.destination);
+    // To hook the stream source we need a media stream; try to reuse existing MediaRecorder's stream
+    // If MediaRecorder exists and has a stream, use it; otherwise, request a new stream
+    let streamForCapture: MediaStream | null = null;
+    if (mediaRecorder && (mediaRecorder as any).stream) {
+      streamForCapture = (mediaRecorder as any).stream as MediaStream;
+    }
+    if (!streamForCapture) {
+      try {
+        streamForCapture = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (err) {
+        console.warn('startAudioCapture: getUserMedia failed', err);
+        return;
+      }
+    }
+    mediaStreamSource = audioCtxCapture.createMediaStreamSource(streamForCapture);
+    mediaStreamSource.connect(audioWorkletNode);
+    audioWorkletNode.connect(captureGainNode);
+  } catch (err) {
+    console.warn('startAudioCapture failed', err);
+    // cleanup on failure
+    try { audioCtxCapture?.close(); } catch (e) {}
+    audioCtxCapture = null;
+    audioWorkletNode = null;
+    mediaStreamSource = null;
+    captureGainNode = null;
+  }
+}
+
+function stopAudioCaptureIfNeeded() {
+  try {
+    if (mediaStreamSource) {
+      try { mediaStreamSource.disconnect(); } catch (e) {}
+      mediaStreamSource = null;
+    }
+    if (audioWorkletNode) {
+      try { audioWorkletNode.port.close(); } catch (e) {}
+      try { audioWorkletNode.disconnect(); } catch (e) {}
+      audioWorkletNode = null;
+    }
+    if (captureGainNode) {
+      try { captureGainNode.disconnect(); } catch (e) {}
+      captureGainNode = null;
+    }
+    if (audioCtxCapture) {
+      try { audioCtxCapture.close(); } catch (e) {}
+      audioCtxCapture = null;
+    }
+  } catch (err) {
+    console.warn('stopAudioCaptureIfNeeded error', err);
+  }
 }
 
 openBtn.addEventListener('click', async () => {
@@ -309,7 +421,13 @@ recordBtn.addEventListener('click', async () => {
         } catch (err) {
           console.error('sendStreamChunk error', err);
         }
+        // If we have an AudioWorklet capturing PCM, it will feed `liveChunks` directly.
+        // Skip decoding the recorded Blob to avoid format/codec decode errors in some engines.
+        if (audioWorkletNode) {
+          return;
+        }
         // Also decode locally and add to live buffer for waveform visualization
+        pendingDecodes++;
         try {
           const { samples, sampleRate } = await decodeArrayBufferToFloat32(ab);
           liveSampleRate = sampleRate || liveSampleRate;
@@ -332,6 +450,8 @@ recordBtn.addEventListener('click', async () => {
           if (!drawAnimationId) startLiveDrawing();
         } catch (err) {
           console.warn('live decode error', err);
+        } finally {
+          pendingDecodes = Math.max(0, pendingDecodes - 1);
         }
       };
       mediaRecorder.onstart = () => {
@@ -341,6 +461,9 @@ recordBtn.addEventListener('click', async () => {
         liveChunks = [];
         drawAnimationId = null;
         startLiveDrawing();
+        // also start AudioWorklet capture for reliable PCM frames
+        // startAudioCapture is async but we don't need to await here
+        startAudioCaptureIfNeeded();
       };
       mediaRecorder.onstop = async () => {
         if (recStatus) recStatus.textContent = 'Finalizing...';
@@ -354,8 +477,23 @@ recordBtn.addEventListener('click', async () => {
           console.error('endStream error', err);
           transcriptEl.textContent = `Error: ${err?.message ?? err}`;
         } finally {
+          // Give the browser a short moment to deliver the final `dataavailable` event
+          // (some engines emit it after `stop` fires). Then wait for pending decodes.
+          await sleep(300);
+          await waitForPendingDecodes(1200);
+          // Force a few final draws to ensure the canvas paints the last frame.
+          try {
+            drawLiveWaveform();
+            await sleep(30);
+            drawLiveWaveform();
+            await sleep(30);
+            drawLiveWaveform();
+          } catch (err) {
+            console.warn('draw final waveform failed', err);
+          }
           if (recStatus) recStatus.textContent = 'Idle';
           currentSessionId = null;
+          stopAudioCaptureIfNeeded();
           stopLiveDrawing();
         }
       };
@@ -386,5 +524,36 @@ saveBtn.addEventListener('click', async () => {
   await window.electronAPI.saveTranscript(txtPath, text);
   alert('Saved: ' + txtPath);
 });
+
+// Manual refresh button: redraw the live waveform or re-render the opened file
+if (refreshBtn) {
+  refreshBtn.addEventListener('click', async () => {
+    try {
+      if (recStatus) recStatus.textContent = 'Refreshing...';
+      adjustCanvasSize();
+      if (liveChunks.length > 0) {
+        // draw current live buffer
+        drawLiveWaveform();
+      } else if (currentAudioPath) {
+        // re-decode and draw the opened file (this also updates transcript text)
+        try {
+          await transcribeFile(currentAudioPath);
+        } catch (err: any) {
+          console.error('refresh: transcribeFile failed', err);
+        }
+      } else {
+        // nothing to draw: clear to white
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const dpr = window.devicePixelRatio || 1;
+        const w = Math.max(1, Math.floor(canvas.width / dpr));
+        const h = Math.max(1, Math.floor(canvas.height / dpr));
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, w, h);
+      }
+    } finally {
+      if (recStatus) recStatus.textContent = 'Idle';
+    }
+  });
+}
 
 export {};
